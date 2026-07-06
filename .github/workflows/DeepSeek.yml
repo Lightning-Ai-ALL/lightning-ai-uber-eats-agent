@@ -1,0 +1,293 @@
+收到，方向完全正確。你現在手上的三個 repo，確實是在做「外送行為的 AI 調度工廠」，而不只是單純的外送應用。
+
+既然你已經把架構拆得這麼清楚，我直接幫你把缺口補上，給出一個可立即運行的 Lightning Control Tower v1 最小原型。它會實作你提到的三大核心：agent registry、event bus、control runtime，並能接上 GitHub Actions 事件觸發。
+
+---
+
+🏗️ Lightning Control Tower v1 極簡可跑架構
+
+```
+lightning-control-tower/
+├── main.py                 # FastAPI 入口，Control Tower 本體
+├── agent_registry.py       # agent 註冊中心
+├── event_bus.py            # 簡單的內部事件總線 (Redis pub/sub)
+├── models.py               # 標準化事件/狀態模型
+├── dashboard.py            # 即時 WebSocket dashboard
+├── agents/                 # 外部 agent 的 plugin 掛載點
+│   ├── uber_agent.py       # 模擬 Uber-Eats 派單邏輯
+│   └── panda_agent.py      # 模擬 foodpanda 狀態機
+├── workflows/              # GitHub Actions 觸發腳本 (可選)
+└── requirements.txt
+```
+
+我們用 FastAPI + Redis + WebSocket 做最輕量的實現，不引入過重框架。
+
+---
+
+🧩 核心程式碼
+
+1. models.py – 標準化訊息格式
+
+```python
+from pydantic import BaseModel
+from typing import Literal, Any, Dict
+from datetime import datetime
+
+class AgentTask(BaseModel):
+    task_id: str
+    agent_type: Literal["uber", "panda"]
+    action: str           # e.g. "dispatch_order", "update_state"
+    payload: Dict[str, Any]
+    timestamp: datetime = datetime.now()
+```
+
+2. event_bus.py – Redis 事件總線
+
+```python
+import redis.asyncio as redis
+import json
+
+class EventBus:
+    def __init__(self, host="localhost", port=6379):
+        self.redis = redis.Redis(host=host, port=port, decode_responses=True)
+
+    async def publish(self, channel: str, message: dict):
+        await self.redis.publish(channel, json.dumps(message, default=str))
+
+    async def subscribe(self, channel: str):
+        pubsub = self.redis.pubsub()
+        await pubsub.subscribe(channel)
+        async for msg in pubsub.listen():
+            if msg["type"] == "message":
+                yield json.loads(msg["data"])
+```
+
+3. agent_registry.py – Agent 註冊與分派
+
+```python
+from typing import Dict, Callable, Any
+from models import AgentTask
+
+class AgentRegistry:
+    def __init__(self):
+        self.agents: Dict[str, Callable] = {}
+
+    def register(self, name: str, handler: Callable):
+        self.agents[name] = handler
+
+    async def dispatch(self, task: AgentTask) -> Any:
+        handler = self.agents.get(task.agent_type)
+        if not handler:
+            raise ValueError(f"Unknown agent: {task.agent_type}")
+        return await handler(task)
+```
+
+4. agents/uber_agent.py – 模擬 Uber 訂單派送
+
+```python
+from models import AgentTask
+import asyncio
+import random
+
+async def handle_uber_task(task: AgentTask) -> dict:
+    if task.action == "dispatch_order":
+        # 模擬派單邏輯：選司機、計算ETA
+        driver_id = f"driver_{random.randint(1,10)}"
+        await asyncio.sleep(0.5)  # 模擬計算
+        return {
+            "status": "dispatched",
+            "driver_id": driver_id,
+            "eta": "10min",
+            "task_id": task.task_id
+        }
+    elif task.action == "cancel_order":
+        return {"status": "cancelled", "task_id": task.task_id}
+    return {"status": "unknown_action"}
+```
+
+5. agents/panda_agent.py – 模擬 foodpanda 狀態機
+
+```python
+from models import AgentTask
+
+STATES = ["pending", "accepted", "preparing", "picked_up", "delivered"]
+
+async def handle_panda_task(task: AgentTask) -> dict:
+    if task.action == "update_state":
+        current = task.payload.get("state", "pending")
+        next_idx = (STATES.index(current) + 1) % len(STATES)
+        new_state = STATES[next_idx]
+        return {
+            "new_state": new_state,
+            "previous_state": current,
+            "task_id": task.task_id
+        }
+    return {"status": "unknown_action"}
+```
+
+6. dashboard.py – 即時 Flow 可視化
+
+```python
+from fastapi import WebSocket
+import asyncio
+import json
+
+class Dashboard:
+    def __init__(self, event_bus):
+        self.event_bus = event_bus
+        self.clients = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.clients.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.clients.remove(websocket)
+
+    async def broadcast_event(self, event: dict):
+        for ws in self.clients:
+            try:
+                await ws.send_text(json.dumps(event, default=str))
+            except:
+                self.clients.remove(ws)
+
+    async def listen_agent_events(self):
+        async for event in self.event_bus.subscribe("agent_events"):
+            await self.broadcast_event(event)
+```
+
+7. main.py – Control Tower 主程式
+
+```python
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from contextlib import asynccontextmanager
+from models import AgentTask
+from agent_registry import AgentRegistry
+from event_bus import EventBus
+from dashboard import Dashboard
+from agents.uber_agent import handle_uber_task
+from agents.panda_agent import handle_panda_task
+import uvicorn
+import asyncio
+
+# 初始化核心組件
+event_bus = EventBus()
+registry = AgentRegistry()
+dashboard = Dashboard(event_bus)
+
+# 註冊 agents
+registry.register("uber", handle_uber_task)
+registry.register("panda", handle_panda_task)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 背景監聽 agent 事件推送到 dashboard
+    asyncio.create_task(dashboard.listen_agent_events())
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+# WebSocket 端點給 dashboard 使用
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await dashboard.connect(websocket)
+    try:
+        while True:
+            # 保持連線
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        dashboard.disconnect(websocket)
+
+# 主要的任務接收接口 (GitHub Actions 或其他觸發器都調用這裡)
+@app.post("/dispatch")
+async def dispatch_task(task: AgentTask):
+    result = await registry.dispatch(task)
+    # 將結果推送到事件總線，讓 dashboard 即時顯示
+    await event_bus.publish("agent_events", {
+        "event": "task_completed",
+        "agent": task.agent_type,
+        "task_id": task.task_id,
+        "result": result
+    })
+    return {"status": "ok", "result": result}
+
+# 簡易 dashboard 頁面
+@app.get("/", response_class=HTMLResponse)
+async def get_dashboard():
+    return """
+    <html>
+    <head><title>Lightning Control Tower v1</title></head>
+    <body>
+        <h1>Live Agent Flow</h1>
+        <pre id="log"></pre>
+        <script>
+            const ws = new WebSocket("ws://" + location.host + "/ws");
+            ws.onmessage = (event) => {
+                const log = document.getElementById("log");
+                log.textContent += event.data + "\\n";
+            };
+        </script>
+    </body>
+    </html>
+    """
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+---
+
+🔄 如何與你的 GitHub Workflows 串接
+
+在你的 lightning-ai-uber-eats-agent repo 裡，.github/workflows 可以直接 POST 任務到這台 Control Tower：
+
+```yaml
+name: Trigger Uber Dispatch
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 每10分鐘
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send dispatch event
+        run: |
+          curl -X POST https://your-tower-url/dispatch \
+            -H "Content-Type: application/json" \
+            -d '{
+              "task_id": "'${{ github.run_id }}'",
+              "agent_type": "uber",
+              "action": "dispatch_order",
+              "payload": {}
+            }'
+```
+
+這樣就實現了你想要的 「事件驅動型 AI 調度工廠」：
+
+· GitHub Actions → 定時/事件觸發
+· Control Tower → 接收、分派、監控
+· Agent Plugin → 執行具體邏輯
+· Dashboard → 即時顯示 flow
+
+---
+
+🚀 啟動方式
+
+1. 確保安裝 Redis 並運行
+2. pip install fastapi uvicorn redis pydantic
+3. python main.py
+4. 打開 http://localhost:8000 看即時 dashboard
+5. 用 POSTman 或 curl 測試 /dispatch，觀察即時更新
+
+---
+
+✅ 這樣你就補上了「Control Tower v1」
+
+你現在不再是只有三個離散的 repo，而是一個 統一的、可運行的調度中樞。下一步可以自然擴展：
+
+· 加入持久化（Postgres）
+· 真實 agent 實作（接上你的 Uber/Panda repo 內的具體邏輯）
+· 加入錯誤重試、平行分派
+
+如果你要繼續升級，說一聲 「Control Tower v2 加入持久化與真實 agent 接點」，我直接把擴充版本寫出來。
